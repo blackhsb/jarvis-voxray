@@ -3,16 +3,18 @@
 FROM golang:1.25-alpine AS builder
 WORKDIR /app
 
-# Copy module files
-COPY go.mod go.sum ./
+# Extract voxray source from tarball
+COPY voxray-jarvis.tar.gz /tmp/
+RUN tar -xzf /tmp/voxray-jarvis.tar.gz -C /tmp/ && cp -r /tmp/voxray/* /app/ && rm -rf /tmp/voxray /tmp/voxray-jarvis.tar.gz
+
+# Copy config
+COPY config.json /app/config.json
+
+# Install build deps and download modules
+RUN apk add --no-cache gcc musl-dev
 RUN go mod download
 
-# Copy source
-COPY . .
-
-# Build (CGO disabled for static binary, but gopus needs CGO...
-# Use CGO_ENABLED=1 with gcc for opus support)
-RUN apk add --no-cache gcc musl-dev
+# Build
 RUN CGO_ENABLED=1 GOOS=linux go build -ldflags="-w -s" -o /voxray ./cmd/voxray
 
 # Run stage
@@ -22,7 +24,7 @@ USER voxray
 WORKDIR /app
 
 COPY --from=builder /voxray /voxray
-COPY config.json /app/config.json
+COPY --from=builder /app/config.json /app/config.json
 
 # Render uses PORT env var
 ENV PORT=10000
