@@ -1,7 +1,7 @@
 From 49e5c4a7aa5206f7b422cbee8aaecb93ac65a7a2 Mon Sep 17 00:00:00 2001
 From: blackhsb <blackhsb5a@gmail.com>
 Date: Sun, 4 Oct 2026 00:14:41 +0000
-Subject: [PATCH 1/2] Jarvis voxray: Vobiz-compatible voice AI
+Subject: [PATCH 1/3] Jarvis voxray: Vobiz-compatible voice AI
 
 ---
  Dockerfile.jarvis                   |  32 ++++++
@@ -332,7 +332,7 @@ index 7b4f02b..0ed9ef8 100644
 From b285fee8e1c9335367def51bd2f3cdd4f2f537d2 Mon Sep 17 00:00:00 2001
 From: blackhsb <blackhsb5a@gmail.com>
 Date: Sun, 4 Oct 2026 00:16:21 +0000
-Subject: [PATCH 2/2] Use Jarvis Dockerfile for Render
+Subject: [PATCH 2/3] Use Jarvis Dockerfile for Render
 
 ---
  Dockerfile | 23 ++++++++++++++---------
@@ -384,6 +384,41 @@ index 235225a..93dc587 100644
  
  ENTRYPOINT ["/voxray"]
  CMD ["-config", "/app/config.json"]
+-- 
+2.43.0
+
+
+From 7fed7c74b63c12cc45d389d0139609cb6cb55023 Mon Sep 17 00:00:00 2001
+From: blackhsb <blackhsb5a@gmail.com>
+Date: Sun, 4 Oct 2026 02:51:13 +0000
+Subject: [PATCH 3/3] Fix: use wss:// behind proxy (X-Forwarded-Proto)
+
+---
+ pkg/server/server.go | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/pkg/server/server.go b/pkg/server/server.go
+index 0ed9ef8..962612f 100644
+--- a/pkg/server/server.go
++++ b/pkg/server/server.go
+@@ -516,7 +516,7 @@ func registerTelephonyRoutes(mux *http.ServeMux, cfg *config.Config, ctx context
+ 				host = r.Host
+ 			}
+ 			scheme := "wss"
+-			if r.TLS == nil {
++			if r.TLS == nil && r.Header.Get("X-Forwarded-Proto") != "https" {
+ 				scheme = "ws"
+ 			}
+ 			wsURL := scheme + "://" + host + "/telephony/ws"
+@@ -588,7 +588,7 @@ func registerTelephonyRoutes(mux *http.ServeMux, cfg *config.Config, ctx context
+ 				host = r.Host
+ 			}
+ 			scheme := "wss"
+-			if r.TLS == nil {
++			if r.TLS == nil && r.Header.Get("X-Forwarded-Proto") != "https" {
+ 				scheme = "ws"
+ 			}
+ 			wsURL := scheme + "://" + host + "/telephony/ws"
 -- 
 2.43.0
 
