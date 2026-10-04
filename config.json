@@ -6,7 +6,7 @@
   },
   "host": "0.0.0.0",
   "interruption_strategy": "keyword",
-  "llm_provider": "gemini",
+  "llm_provider": "google",
   "log_level": "info",
   "min_words": 3,
   "model": "gemini-flash-lite-latest",
