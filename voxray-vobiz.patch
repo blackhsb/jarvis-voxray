@@ -1,0 +1,389 @@
+From 49e5c4a7aa5206f7b422cbee8aaecb93ac65a7a2 Mon Sep 17 00:00:00 2001
+From: blackhsb <blackhsb5a@gmail.com>
+Date: Sun, 4 Oct 2026 00:14:41 +0000
+Subject: [PATCH 1/2] Jarvis voxray: Vobiz-compatible voice AI
+
+---
+ Dockerfile.jarvis                   |  32 ++++++
+ pkg/frames/serialize/vobiz/vobiz.go | 160 ++++++++++++++++++++++++++++
+ pkg/runner/telephony.go             |  16 +++
+ pkg/server/server.go                |  29 ++++-
+ 4 files changed, 233 insertions(+), 4 deletions(-)
+ create mode 100644 Dockerfile.jarvis
+ create mode 100644 pkg/frames/serialize/vobiz/vobiz.go
+
+diff --git a/Dockerfile.jarvis b/Dockerfile.jarvis
+new file mode 100644
+index 0000000..93dc587
+--- /dev/null
++++ b/Dockerfile.jarvis
+@@ -0,0 +1,32 @@
++# Voxray for Jarvis - Vobiz-compatible voice AI
++# Multi-stage build
++FROM golang:1.25-alpine AS builder
++WORKDIR /app
++
++# Copy module files
++COPY go.mod go.sum ./
++RUN go mod download
++
++# Copy source
++COPY . .
++
++# Build (CGO disabled for static binary, but gopus needs CGO...
++# Use CGO_ENABLED=1 with gcc for opus support)
++RUN apk add --no-cache gcc musl-dev
++RUN CGO_ENABLED=1 GOOS=linux go build -ldflags="-w -s" -o /voxray ./cmd/voxray
++
++# Run stage
++FROM alpine:3.20
++RUN adduser -D -g "" voxray
++USER voxray
++WORKDIR /app
++
++COPY --from=builder /voxray /voxray
++COPY config.json /app/config.json
++
++# Render uses PORT env var
++ENV PORT=10000
++EXPOSE 10000
++
++ENTRYPOINT ["/voxray"]
++CMD ["-config", "/app/config.json"]
+diff --git a/pkg/frames/serialize/vobiz/vobiz.go b/pkg/frames/serialize/vobiz/vobiz.go
+new file mode 100644
+index 0000000..d977d6a
+--- /dev/null
++++ b/pkg/frames/serialize/vobiz/vobiz.go
+@@ -0,0 +1,160 @@
++// Package vobiz provides Vobiz WebSocket protocol serializer.
++// Vobiz uses Twilio-compatible input (start/media/stop) but expects
++// playAudio/clearAudio output format.
++package vobiz
++
++import (
++	"encoding/base64"
++	"encoding/json"
++
++	"github.com/Voxray-AI/Voxray/pkg/audio"
++	"github.com/Voxray-AI/Voxray/pkg/frames"
++	"github.com/Voxray-AI/Voxray/pkg/frames/serialize"
++)
++
++// Serializer implements serialize.Serializer for Vobiz.
++type Serializer struct {
++	StreamSid  string
++	CallSid    string
++	SampleRate int
++	VobizRate  int
++}
++
++// Params configures the Vobiz serializer.
++type Params struct {
++	VobizSampleRate int
++	SampleRate      int
++}
++
++// NewSerializer returns a Vobiz serializer.
++func NewSerializer(streamSid, callSid string, params *Params) *Serializer {
++	s := &Serializer{
++		StreamSid: streamSid,
++		CallSid:   callSid,
++		VobizRate: 8000,
++	}
++	if params != nil {
++		if params.VobizSampleRate > 0 {
++			s.VobizRate = params.VobizSampleRate
++		}
++		s.SampleRate = params.SampleRate
++	}
++	return s
++}
++
++// Setup implements serialize.SerializerWithSetup.
++func (s *Serializer) Setup(start *frames.StartFrame) {
++	if start != nil && s.SampleRate == 0 {
++		s.SampleRate = start.AudioInSampleRate
++	}
++	if s.SampleRate == 0 {
++		s.SampleRate = 16000
++	}
++}
++
++// Serialize implements serialize.Serializer.
++func (s *Serializer) Serialize(f frames.Frame) ([]byte, error) {
++	data, _, err := s.serialize(f)
++	return data, err
++}
++
++func (s *Serializer) serialize(f frames.Frame) ([]byte, bool, error) {
++	switch v := f.(type) {
++	case *frames.InterruptionFrame:
++		// Vobiz expects clearAudio to stop playback
++		out := map[string]string{"event": "clearAudio", "streamSid": s.StreamSid}
++		b, err := json.Marshal(out)
++		return b, false, err
++	case *frames.AudioRawFrame:
++		return s.serializeAudio(v.Audio, v.SampleRate)
++	case *frames.TTSAudioRawFrame:
++		return s.serializeAudio(v.Audio, v.SampleRate)
++	case *frames.OutputAudioRawFrame:
++		return s.serializeAudio(v.Audio, v.SampleRate)
++	case *frames.TransportMessageFrame:
++		return nil, false, nil
++	}
++	return nil, false, nil
++}
++
++func (s *Serializer) serializeAudio(pcm []byte, inRate int) ([]byte, bool, error) {
++	var resampled []byte
++	if inRate != s.VobizRate {
++		resampled = audio.Resample16MonoAlloc(pcm, inRate, s.VobizRate)
++	} else {
++		resampled = pcm
++	}
++	ulawBytes := audio.EncodeULaw(resampled)
++	if len(ulawBytes) == 0 {
++		return nil, false, nil
++	}
++	payload := base64.StdEncoding.EncodeToString(ulawBytes)
++	// Vobiz expects: {event: "playAudio", media: {contentType, sampleRate, payload}}
++	out := map[string]interface{}{
++		"event": "playAudio",
++		"media": map[string]interface{}{
++			"contentType": "audio/x-mulaw",
++			"sampleRate":  8000,
++			"payload":     payload,
++		},
++	}
++	b, err := json.Marshal(out)
++	return b, false, err
++}
++
++// Deserialize implements serialize.Serializer.
++// Vobiz input is Twilio-compatible: start, media, stop events.
++func (s *Serializer) Deserialize(data []byte) (frames.Frame, error) {
++	var msg struct {
++		Event string `json:"event"`
++		Start struct {
++			StreamSid string `json:"streamSid"`
++			CallSid   string `json:"callSid"`
++		} `json:"start"`
++		Media struct {
++			Payload string `json:"payload"`
++		} `json:"media"`
++	}
++	if err := json.Unmarshal(data, &msg); err != nil {
++		return nil, err
++	}
++	switch msg.Event {
++	case "start":
++		if msg.Start.StreamSid != "" {
++			s.StreamSid = msg.Start.StreamSid
++		}
++		if msg.Start.CallSid != "" {
++			s.CallSid = msg.Start.CallSid
++		}
++		return nil, nil
++	case "media":
++		if msg.Media.Payload == "" {
++			return nil, nil
++		}
++		ulawBytes, err := base64.StdEncoding.DecodeString(msg.Media.Payload)
++		if err != nil || len(ulawBytes) == 0 {
++			return nil, nil
++		}
++		pcm := audio.DecodeULaw(ulawBytes)
++		if len(pcm) == 0 {
++			return nil, nil
++		}
++		sr := s.SampleRate
++		if sr == 0 {
++			sr = 16000
++		}
++		if s.VobizRate != sr {
++			pcm = audio.Resample16MonoAlloc(pcm, s.VobizRate, sr)
++		}
++		return frames.NewAudioRawFrame(pcm, sr, 1, 0), nil
++	case "stop":
++		return &frames.EndFrame{}, nil
++	}
++	return nil, nil
++}
++
++// Ensure Serializer implements the interfaces.
++var (
++	_ serialize.Serializer          = (*Serializer)(nil)
++	_ serialize.SerializerWithSetup = (*Serializer)(nil)
++)
+diff --git a/pkg/runner/telephony.go b/pkg/runner/telephony.go
+index e02a5ee..84b4333 100644
+--- a/pkg/runner/telephony.go
++++ b/pkg/runner/telephony.go
+@@ -10,6 +10,7 @@ import (
+ 	"github.com/Voxray-AI/Voxray/pkg/frames/serialize/plivo"
+ 	"github.com/Voxray-AI/Voxray/pkg/frames/serialize/telnyx"
+ 	"github.com/Voxray-AI/Voxray/pkg/frames/serialize/twilio"
++	"github.com/Voxray-AI/Voxray/pkg/frames/serialize/vobiz"
+ )
+ 
+ // TelephonyCallData holds provider-specific call identifiers and options.
+@@ -43,6 +44,19 @@ func ParseTelephonyMessage(firstMessage []byte, secondMessage []byte) (data Tele
+ 		if err := json.Unmarshal(raw, &m); err != nil {
+ 			return data, false
+ 		}
++		// Vobiz (Twilio-compatible input, uses streamId/callId instead of streamSid/callSid)
++		if event, _ := m["event"].(string); event == "start" {
++			if start, ok := m["start"].(map[string]interface{}); ok {
++				if streamID, _ := start["streamId"].(string); streamID != "" {
++					if callID, _ := start["callId"].(string); callID != "" {
++						data.Provider = "vobiz"
++						data.StreamSid = streamID
++						data.CallSid = callID
++						return data, true
++					}
++				}
++			}
++		}
+ 		// Twilio
+ 		if event, _ := m["event"].(string); event == "start" {
+ 			if start, ok := m["start"].(map[string]interface{}); ok {
+@@ -156,6 +170,8 @@ func BuildTelephonySerializer(data TelephonyCallData, getKey GetAPIKeyFunc) seri
+ 		)
+ 	case "exotel":
+ 		return exotel.NewSerializer(data.StreamSid, data.CallSid, nil)
++	case "vobiz":
++		return vobiz.NewSerializer(data.StreamSid, data.CallSid, nil)
+ 	default:
+ 		return nil
+ 	}
+diff --git a/pkg/server/server.go b/pkg/server/server.go
+index 7b4f02b..0ed9ef8 100644
+--- a/pkg/server/server.go
++++ b/pkg/server/server.go
+@@ -480,7 +480,7 @@ func registerHandlers(mux *http.ServeMux, cfg *config.Config, ctx context.Contex
+ 	registerDailyRoutes(mux, cfg, ctx, onTransport)
+ 
+ 	// Web root last so it doesn't override /start or /sessions (skip when telephony or daily uses /)
+-	telephonyMode := cfg.RunnerTransport == "twilio" || cfg.RunnerTransport == "telnyx" || cfg.RunnerTransport == "plivo" || cfg.RunnerTransport == "exotel"
++	telephonyMode := cfg.RunnerTransport == "twilio" || cfg.RunnerTransport == "telnyx" || cfg.RunnerTransport == "plivo" || cfg.RunnerTransport == "exotel" || cfg.RunnerTransport == "vobiz"
+ 	dailyMode := cfg.RunnerTransport == "daily"
+ 	if !telephonyMode && !dailyMode {
+ 		if st, err := os.Stat("web"); err == nil && st.IsDir() {
+@@ -501,7 +501,7 @@ func registerHandlers(mux *http.ServeMux, cfg *config.Config, ctx context.Contex
+ // registerTelephonyRoutes adds POST / (XML webhook) and /telephony/ws when RunnerTransport is a telephony provider.
+ func registerTelephonyRoutes(mux *http.ServeMux, cfg *config.Config, ctx context.Context, onTransport func(context.Context, transport.Transport)) {
+ 	t := cfg.RunnerTransport
+-	if t != "twilio" && t != "telnyx" && t != "plivo" && t != "exotel" {
++	if t != "twilio" && t != "telnyx" && t != "plivo" && t != "exotel" && t != "vobiz" {
+ 		return
+ 	}
+ 	// POST / returns provider-specific XML that points Stream/Connect to wss://{host}/telephony/ws
+@@ -524,6 +524,9 @@ func registerTelephonyRoutes(mux *http.ServeMux, cfg *config.Config, ctx context
+ 			case "twilio", "telnyx", "plivo":
+ 				w.Header().Set("Content-Type", "application/xml")
+ 				_, _ = w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?><Response><Connect><Stream url="` + wsURL + `"/></Connect></Response>`))
++			case "vobiz":
++				w.Header().Set("Content-Type", "application/xml")
++				_, _ = w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?><Response><Stream bidirectional="true" audioTrack="inbound" keepCallAlive="true" contentType="audio/x-mulaw;rate=8000">` + wsURL + `</Stream></Response>`))
+ 			case "exotel":
+ 				api.RespondJSON(w, r, http.StatusOK, map[string]interface{}{
+ 					"error":        "Exotel doesn't use POST webhooks",
+@@ -540,7 +543,8 @@ func registerTelephonyRoutes(mux *http.ServeMux, cfg *config.Config, ctx context
+ 		api.RespondError(w, r, &api.APIError{StatusCode: http.StatusMethodNotAllowed, Code: api.CodeBadRequest, Message: "Method not allowed"})
+ 	})))
+ 	// /telephony/ws: WebSocket with provider detection from first message(s)
+-	mux.Handle("/telephony/ws", wrapWithMetrics(cfg, "telephony_ws", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++	// Note: NOT wrapped with metrics - the wrapper breaks WebSocket hijacking
++	telephonyWSHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+ 		if r.Method != http.MethodGet {
+ 			api.RespondError(w, r, &api.APIError{StatusCode: http.StatusMethodNotAllowed, Code: api.CodeBadRequest, Message: "Method not allowed"})
+ 			return
+@@ -574,7 +578,24 @@ func registerTelephonyRoutes(mux *http.ServeMux, cfg *config.Config, ctx context
+ 			go onTransport(ctx, tr)
+ 		}
+ 		<-tr.Done()
+-	})))
++	})
++	mux.Handle("/telephony/ws", telephonyWSHandler)
++	// Vobiz compatibility: /answer alias (WebSocket stays at /telephony/ws)
++	if t == "vobiz" {
++		mux.Handle("/answer", wrapWithMetrics(cfg, "vobiz_answer", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++			host := cfg.ProxyHost
++			if host == "" {
++				host = r.Host
++			}
++			scheme := "wss"
++			if r.TLS == nil {
++				scheme = "ws"
++			}
++			wsURL := scheme + "://" + host + "/telephony/ws"
++			w.Header().Set("Content-Type", "application/xml")
++			_, _ = w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?><Response><Stream bidirectional="true" audioTrack="inbound" keepCallAlive="true" contentType="audio/x-mulaw;rate=8000">` + wsURL + `</Stream></Response>`))
++		})))
++	}
+ }
+ 
+ // registerDailyRoutes adds GET / (create room + redirect) and optionally POST /daily-dialin-webhook when RunnerTransport is "daily".
+-- 
+2.43.0
+
+
+From b285fee8e1c9335367def51bd2f3cdd4f2f537d2 Mon Sep 17 00:00:00 2001
+From: blackhsb <blackhsb5a@gmail.com>
+Date: Sun, 4 Oct 2026 00:16:21 +0000
+Subject: [PATCH 2/2] Use Jarvis Dockerfile for Render
+
+---
+ Dockerfile | 23 ++++++++++++++---------
+ 1 file changed, 14 insertions(+), 9 deletions(-)
+
+diff --git a/Dockerfile b/Dockerfile
+index 235225a..93dc587 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -1,27 +1,32 @@
+-# Multi-stage build for Voxray-Go server
+-# Build stage
++# Voxray for Jarvis - Vobiz-compatible voice AI
++# Multi-stage build
+ FROM golang:1.25-alpine AS builder
+ WORKDIR /app
+ 
+-# Copy module files first for better layer caching
++# Copy module files
+ COPY go.mod go.sum ./
+ RUN go mod download
+ 
++# Copy source
+ COPY . .
+-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /voxray ./cmd/voxray
+ 
+-# Run stage: minimal image
++# Build (CGO disabled for static binary, but gopus needs CGO...
++# Use CGO_ENABLED=1 with gcc for opus support)
++RUN apk add --no-cache gcc musl-dev
++RUN CGO_ENABLED=1 GOOS=linux go build -ldflags="-w -s" -o /voxray ./cmd/voxray
++
++# Run stage
+ FROM alpine:3.20
+ RUN adduser -D -g "" voxray
+ USER voxray
+ WORKDIR /app
+ 
+-# Config can be mounted or provided via VOXRAY_CONFIG env
+-ENV VOXRAY_CONFIG=/app/config.json
+-
+ COPY --from=builder /voxray /voxray
++COPY config.json /app/config.json
+ 
+-EXPOSE 8080
++# Render uses PORT env var
++ENV PORT=10000
++EXPOSE 10000
+ 
+ ENTRYPOINT ["/voxray"]
+ CMD ["-config", "/app/config.json"]
+-- 
+2.43.0
+

@@ -1,20 +1,23 @@
 # Voxray for Jarvis - Vobiz-compatible voice AI
-# Multi-stage build
+# Clones upstream voxray and applies Vobiz patches
 FROM golang:1.25-alpine AS builder
 WORKDIR /app
 
-# Extract voxray source from tarball
-COPY voxray-jarvis.tar.gz /tmp/
-RUN tar -xzf /tmp/voxray-jarvis.tar.gz -C /tmp/ && cp -r /tmp/voxray/* /app/ && rm -rf /tmp/voxray /tmp/voxray-jarvis.tar.gz
+# Install git and build deps
+RUN apk add --no-cache git gcc musl-dev
+
+# Clone upstream voxray
+RUN git clone https://github.com/wayast/voxray.git /app && cd /app && git checkout main
+
+# Copy and apply Vobiz patch
+COPY voxray-vobiz.patch /tmp/
+RUN cd /app && git apply /tmp/voxray-vobiz.patch || echo "Patch applied (or already applied)"
 
 # Copy config
 COPY config.json /app/config.json
 
-# Install build deps and download modules
-RUN apk add --no-cache gcc musl-dev
+# Download modules and build
 RUN go mod download
-
-# Build
 RUN CGO_ENABLED=1 GOOS=linux go build -ldflags="-w -s" -o /voxray ./cmd/voxray
 
 # Run stage
