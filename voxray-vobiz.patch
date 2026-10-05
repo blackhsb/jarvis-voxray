@@ -338,6 +338,71 @@ index 0000000..495b6f3
 +		t.Fatal("unsupported format accepted")
 +	}
 +}
+diff --git a/pkg/processors/voice/llm.go b/pkg/processors/voice/llm.go
+index 24c1009..0364400 100644
+--- a/pkg/processors/voice/llm.go
++++ b/pkg/processors/voice/llm.go
+@@ -73,11 +73,7 @@ func (p *LLMProcessor) ProcessFrame(ctx context.Context, f frames.Frame, dir pro
+ 
+ 	switch t := f.(type) {
+ 	case *frames.TranscriptionFrame:
+-		preview := t.Text
+-		if len(preview) > 80 {
+-			preview = preview[:80] + "..."
+-		}
+-		logger.Info("LLM: transcript received from STT: %d chars, preview=%q", len(t.Text), preview)
++		logger.Info("LLM: transcript received: %d chars", len(t.Text))
+ 		p.mu.Lock()
+ 		p.msgs = append(p.msgs, map[string]any{"role": "user", "content": t.Text})
+ 		p.notifyContextUpdateLocked()
+@@ -133,11 +129,7 @@ func (p *LLMProcessor) runLLMWithMessages(ctx context.Context, messages []map[st
+ 		logger.Info("LLM: response complete but empty (no text to send to TTS)")
+ 	}
+ 	if fullContent != "" {
+-		preview := fullContent
+-		if len(preview) > 80 {
+-			preview = preview[:80] + "..."
+-		}
+-		logger.Info("LLM: response complete, sending to TTS: %d chars, preview=%q", len(fullContent), preview)
++		logger.Info("LLM: response complete: %d chars", len(fullContent))
+ 		p.mu.Lock()
+ 		p.msgs = append(p.msgs, map[string]any{"role": "assistant", "content": fullContent})
+ 		p.notifyContextUpdateLocked()
+diff --git a/pkg/processors/voice/stt.go b/pkg/processors/voice/stt.go
+index 2fef5f2..ad9f249 100644
+--- a/pkg/processors/voice/stt.go
++++ b/pkg/processors/voice/stt.go
+@@ -111,12 +111,7 @@ func (p *STTProcessor) ProcessFrame(ctx context.Context, f frames.Frame, dir pro
+ 			continue
+ 		}
+ 		tf.Text = text
+-		preview := text
+-		if len(preview) > 80 {
+-			preview = preview[:80] + "..."
+-		}
+-		logger.Info("STT output (to LLM): processor=%s textLen=%d finalized=%v language=%q preview=%q",
+-			p.Name(), len(text), tf.Finalized, tf.Language, preview)
++		logger.Info("STT output: textLen=%d finalized=%v language=%q", len(text), tf.Finalized, tf.Language)
+ 		_ = p.PushDownstream(ctx, tf)
+ 	}
+ 	return nil
+diff --git a/pkg/processors/voice/tts.go b/pkg/processors/voice/tts.go
+index 26a5ede..177d268 100644
+--- a/pkg/processors/voice/tts.go
++++ b/pkg/processors/voice/tts.go
+@@ -123,11 +123,7 @@ func (p *TTSProcessor) flush(ctx context.Context) error {
+ 
+ func (p *TTSProcessor) speak(ctx context.Context, text string) error {
+ 	runes := []rune(text)
+-	preview := text
+-	if len(runes) > 80 {
+-		preview = string(runes[:80]) + "..."
+-	}
+-	logger.Info("TTS: received text to speak: %d runes (batched), preview=%q", len(runes), preview)
++	logger.Info("TTS: received text: %d runes", len(runes))
+ 
+ 	start := time.Now()
+ 	audioFrames, err := p.TTS.Speak(ctx, text, p.SampleRate)
 diff --git a/pkg/processors/voice/turn.go b/pkg/processors/voice/turn.go
 index 901d607..738aee7 100644
 --- a/pkg/processors/voice/turn.go
@@ -525,3 +590,150 @@ index 7b4f02b..714176e 100644
  }
  
  // registerDailyRoutes adds GET / (create room + redirect) and optionally POST /daily-dialin-webhook when RunnerTransport is "daily".
+diff --git a/pkg/services/stt/groq.go b/pkg/services/stt/groq.go
+index d01a11e..3436d4c 100644
+--- a/pkg/services/stt/groq.go
++++ b/pkg/services/stt/groq.go
+@@ -2,7 +2,11 @@
+ package stt
+ 
+ import (
++	"bytes"
+ 	"context"
++	"encoding/binary"
++	"errors"
++	"fmt"
+ 	"os"
+ 	"path/filepath"
+ 
+@@ -52,7 +56,12 @@ func (s *GroqService) Transcribe(ctx context.Context, audio []byte, sampleRate,
+ 	}
+ 	path := tmp.Name()
+ 	defer os.Remove(path)
+-	if _, err := tmp.Write(audio); err != nil {
++	wav, err := pcmWAV(audio, sampleRate, numChannels)
++	if err != nil {
++		tmp.Close()
++		return nil, err
++	}
++	if _, err := tmp.Write(wav); err != nil {
+ 		tmp.Close()
+ 		return nil, err
+ 	}
+@@ -67,6 +76,12 @@ func (s *GroqService) Transcribe(ctx context.Context, audio []byte, sampleRate,
+ 	}
+ 	resp, err := s.client.CreateTranscription(ctx, req)
+ 	if err != nil {
++		var apiErr *openai.APIError
++		if errors.As(err, &apiErr) {
++			logger.Error("STT provider failure: provider=groq status=%d", apiErr.HTTPStatusCode)
++		} else {
++			logger.Error("STT provider failure: provider=groq category=transport_or_decode")
++		}
+ 		return nil, err
+ 	}
+ 	// Log STT response to verify correct/expected format (Groq Whisper: text + optional language).
+@@ -78,12 +93,7 @@ func (s *GroqService) Transcribe(ctx context.Context, audio []byte, sampleRate,
+ 	logger.Info("STT response: model=%s audioBytes=%d textLen=%d language=%s\n", s.model, len(audio), textLen, language)
+ 	if textLen == 0 {
+ 		logger.Info("STT response has empty text (check audio length >= 0.01s, format wav/flac/mp3, or prompt)\n")
+-	} else {
+-		preview := resp.Text
+-		if len(preview) > 120 {
+-			preview = preview[:120] + "..."
+-		}
+-		logger.Info("STT text preview: %q\n", preview)
++
+ 	}
+ 	tf := frames.NewTranscriptionFrame(resp.Text, "user", "", true)
+ 	if resp.Language != "" {
+@@ -119,3 +129,25 @@ func (s *GroqService) TranscribeStream(ctx context.Context, audioCh <-chan []byt
+ 		}
+ 	}
+ }
++
++// pcmWAV wraps interleaved signed little-endian 16-bit PCM in a valid WAV container.
++func pcmWAV(pcm []byte, rate, channels int) ([]byte, error) {
++	if rate <= 0 || channels <= 0 || channels > 2 || len(pcm) == 0 || len(pcm)%(2*channels) != 0 || uint64(len(pcm)) > uint64(^uint32(0))-36 {
++		return nil, fmt.Errorf("invalid PCM dimensions")
++	}
++	var b bytes.Buffer
++	b.WriteString("RIFF")
++	binary.Write(&b, binary.LittleEndian, uint32(36+len(pcm)))
++	b.WriteString("WAVEfmt ")
++	binary.Write(&b, binary.LittleEndian, uint32(16))
++	binary.Write(&b, binary.LittleEndian, uint16(1))
++	binary.Write(&b, binary.LittleEndian, uint16(channels))
++	binary.Write(&b, binary.LittleEndian, uint32(rate))
++	binary.Write(&b, binary.LittleEndian, uint32(rate*channels*2))
++	binary.Write(&b, binary.LittleEndian, uint16(channels*2))
++	binary.Write(&b, binary.LittleEndian, uint16(16))
++	b.WriteString("data")
++	binary.Write(&b, binary.LittleEndian, uint32(len(pcm)))
++	b.Write(pcm)
++	return b.Bytes(), nil
++}
+diff --git a/pkg/services/stt/groq_wav_test.go b/pkg/services/stt/groq_wav_test.go
+new file mode 100644
+index 0000000..5bf9994
+--- /dev/null
++++ b/pkg/services/stt/groq_wav_test.go
+@@ -0,0 +1,58 @@
++package stt
++
++import (
++	"bytes"
++	"context"
++	"encoding/binary"
++	openai "github.com/sashabaranov/go-openai"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"testing"
++)
++
++func TestPCMHeader(t *testing.T) {
++	pcm := []byte{1, 0, 2, 0}
++	w, e := pcmWAV(pcm, 16000, 1)
++	if e != nil {
++		t.Fatal(e)
++	}
++	if string(w[:4]) != "RIFF" || string(w[8:12]) != "WAVE" || string(w[36:40]) != "data" || binary.LittleEndian.Uint32(w[24:28]) != 16000 || binary.LittleEndian.Uint32(w[40:44]) != 4 || !bytes.Equal(w[44:], pcm) {
++		t.Fatal("bad WAV")
++	}
++	if _, e := pcmWAV([]byte{1}, 16000, 1); e == nil {
++		t.Fatal("odd PCM accepted")
++	}
++}
++func TestGroqMultipartHasWAV(t *testing.T) {
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if err := r.ParseMultipartForm(1 << 20); err != nil {
++			t.Error(err)
++			w.WriteHeader(400)
++			return
++		}
++		f, _, e := r.FormFile("file")
++		if e != nil {
++			t.Error(e)
++			return
++		}
++		defer f.Close()
++		b, _ := io.ReadAll(f)
++		if len(b) != 48 || string(b[:4]) != "RIFF" || string(b[8:12]) != "WAVE" {
++			t.Errorf("invalid uploaded audio %d", len(b))
++		}
++		if r.FormValue("model") != "whisper-large-v3" {
++			t.Error("model missing")
++		}
++		w.Header().Set("Content-Type", "application/json")
++		io.WriteString(w, `{"text":"test"}`)
++	}))
++	defer server.Close()
++	cfg := openai.DefaultConfig("synthetic")
++	cfg.BaseURL = server.URL
++	s := &GroqService{client: openai.NewClientWithConfig(cfg), model: "whisper-large-v3"}
++	fs, e := s.Transcribe(context.Background(), []byte{1, 0, 2, 0}, 16000, 1)
++	if e != nil || len(fs) != 1 {
++		t.Fatalf("%v", e)
++	}
++}
