@@ -23,6 +23,8 @@
   "turn_pre_speech_ms": 100,
   "turn_stop_secs": 1.5,
   "vad_stop_secs": 0.3,
-  "vad_threshold": 0.02,
-  "vad_type": "energy"
+  "vad_threshold": 0.01,
+  "vad_type": "energy",
+  "vad_min_volume": 0.005,
+  "vad_confidence": 0.5
 }
