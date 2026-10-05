@@ -1,1 +1,28 @@
-{"allow_interruptions":true,"api_keys":{"groq":""},"host":"0.0.0.0","interruption_strategy":"keyword","llm_provider":"groq","log_level":"info","min_words":3,"model":"llama-3.1-8b-instant","port":8000,"provider":"groq","runner_transport":"vobiz","stt_language":"hi-IN","stt_model":"whisper-large-v3","stt_provider":"groq","transport":"both","tts_model":"canopylabs/orpheus-v1-english","tts_provider":"groq","tts_voice":"alloy","turn_detection":"silence","turn_pre_speech_ms":100,"turn_stop_secs":1.5,"vad_stop_secs":0.3,"vad_threshold":0.02,"vad_type":"energy"}
+{
+  "allow_interruptions": true,
+  "api_keys": {
+    "groq": ""
+  },
+  "host": "0.0.0.0",
+  "interruption_strategy": "keyword",
+  "llm_provider": "groq",
+  "log_level": "info",
+  "min_words": 3,
+  "model": "llama-3.1-8b-instant",
+  "port": 8000,
+  "provider": "groq",
+  "runner_transport": "vobiz",
+  "stt_language": "hi-IN",
+  "stt_model": "whisper-large-v3",
+  "stt_provider": "groq",
+  "transport": "both",
+  "tts_model": "canopylabs/orpheus-v1-english",
+  "tts_provider": "groq",
+  "tts_voice": "troy",
+  "turn_detection": "silence",
+  "turn_pre_speech_ms": 100,
+  "turn_stop_secs": 1.5,
+  "vad_stop_secs": 0.3,
+  "vad_threshold": 0.02,
+  "vad_type": "energy"
+}
