@@ -1,9 +1,28 @@
+diff --git a/cmd/voxray/main.go b/cmd/voxray/main.go
+index b9aa1ef..3945524 100644
+--- a/cmd/voxray/main.go
++++ b/cmd/voxray/main.go
+@@ -275,11 +275,11 @@ func run(configPath string, flags runFlags) (forced bool, err error) {
+ 					// Energy VAD: volume (smoothed RMS) from typical mics often stays well below 0.2,
+ 					// so cap MinVolume at 0.05 so speech is detected when confidence is high.
+ 					conf, minVol := vp.Confidence, vp.MinVolume
+-					if conf > 0.5 {
++					if conf <= 0 || conf > 0.5 {
+ 						conf = 0.5
+ 					}
+-					if minVol > 0.05 {
+-						minVol = 0.05
++					if minVol <= 0 || minVol > 0.005 {
++						minVol = 0.005
+ 					}
+ 					// Cap RMS threshold at 0.01 so that conf = rms/threshold reaches 0.5 at rms >= 0.005;
+ 					// otherwise vad_threshold 0.02 requires rms >= 0.01 and many mics never trigger speech.
 diff --git a/pkg/frames/serialize/vobiz/vobiz.go b/pkg/frames/serialize/vobiz/vobiz.go
 new file mode 100644
-index 0000000..a29ca2d
+index 0000000..bc9f4bc
 --- /dev/null
 +++ b/pkg/frames/serialize/vobiz/vobiz.go
-@@ -0,0 +1,172 @@
+@@ -0,0 +1,224 @@
 +// Package vobiz provides Vobiz WebSocket protocol serializer.
 +// Vobiz uses Twilio-compatible input (start/media/stop) but expects
 +// playAudio/clearAudio output format.
@@ -11,7 +30,12 @@ index 0000000..a29ca2d
 +
 +import (
 +	"encoding/base64"
++	"encoding/binary"
 +	"encoding/json"
++	"fmt"
++	"github.com/Voxray-AI/Voxray/pkg/logger"
++	"math"
++	"strings"
 +
 +	"github.com/Voxray-AI/Voxray/pkg/audio"
 +	"github.com/Voxray-AI/Voxray/pkg/frames"
@@ -24,6 +48,12 @@ index 0000000..a29ca2d
 +	CallSid    string
 +	SampleRate int
 +	VobizRate  int
++	Encoding   string
++	chunks     int
++	sumSquares float64
++	samples    int
++	peak       float64
++	outChunks  int
 +}
 +
 +// Params configures the Vobiz serializer.
@@ -38,6 +68,7 @@ index 0000000..a29ca2d
 +		StreamSid: streamSid,
 +		CallSid:   callSid,
 +		VobizRate: 8000,
++		Encoding:  "audio/x-mulaw",
 +	}
 +	if params != nil {
 +		if params.VobizSampleRate > 0 {
@@ -85,11 +116,14 @@ index 0000000..a29ca2d
 +
 +func (s *Serializer) serializeAudio(pcm []byte, inRate int) ([]byte, bool, error) {
 +	if s.StreamSid == "" {
-+		return nil, false, nil
++		return nil, false, fmt.Errorf("vobiz playback has no streamId")
++	}
++	if inRate <= 0 || len(pcm)%2 != 0 {
++		return nil, false, fmt.Errorf("invalid playback PCM/rate")
 +	}
 +	var resampled []byte
-+	if inRate != s.VobizRate {
-+		resampled = audio.Resample16MonoAlloc(pcm, inRate, s.VobizRate)
++	if inRate != 8000 {
++		resampled = audio.Resample16MonoAlloc(pcm, inRate, 8000)
 +	} else {
 +		resampled = pcm
 +	}
@@ -109,6 +143,10 @@ index 0000000..a29ca2d
 +		},
 +	}
 +	b, err := json.Marshal(out)
++	s.outChunks++
++	if s.outChunks == 1 || s.outChunks%50 == 0 {
++		logger.Info("vobiz playback: chunks=%d ulaw_bytes=%d rate=8000 stream_id_present=true", s.outChunks, len(ulawBytes))
++	}
 +	return b, false, err
 +}
 +
@@ -118,10 +156,15 @@ index 0000000..a29ca2d
 +	var msg struct {
 +		Event string `json:"event"`
 +		Start struct {
-+			StreamSid string `json:"streamSid"`
-+			StreamId  string `json:"streamId"`
-+			CallSid   string `json:"callSid"`
-+			CallId    string `json:"callId"`
++			StreamSid   string `json:"streamSid"`
++			StreamId    string `json:"streamId"`
++			CallSid     string `json:"callSid"`
++			CallId      string `json:"callId"`
++			MediaFormat struct {
++				Encoding   string `json:"encoding"`
++				SampleRate int    `json:"sampleRate"`
++				Channels   int    `json:"channels"`
++			} `json:"mediaFormat"`
 +		} `json:"start"`
 +		Media struct {
 +			Payload string `json:"payload"`
@@ -132,6 +175,17 @@ index 0000000..a29ca2d
 +	}
 +	switch msg.Event {
 +	case "start":
++		mf := msg.Start.MediaFormat
++		if mf.Encoding != "" {
++			s.Encoding = strings.ToLower(mf.Encoding)
++		}
++		if mf.SampleRate > 0 {
++			s.VobizRate = mf.SampleRate
++		}
++		if mf.Channels > 1 || (s.Encoding != "audio/x-mulaw" && s.Encoding != "audio/x-l16") || (s.Encoding == "audio/x-mulaw" && s.VobizRate != 8000) || (s.Encoding == "audio/x-l16" && s.VobizRate != 8000 && s.VobizRate != 16000) {
++			return nil, fmt.Errorf("unsupported vobiz inbound media format: %s/%d channels=%d", s.Encoding, s.VobizRate, mf.Channels)
++		}
++		logger.Info("vobiz inbound format: encoding=%s rate=%d channels=%d", s.Encoding, s.VobizRate, mf.Channels)
 +		if msg.Start.StreamId != "" {
 +			s.StreamSid = msg.Start.StreamId
 +		}
@@ -153,7 +207,12 @@ index 0000000..a29ca2d
 +		if err != nil || len(ulawBytes) == 0 {
 +			return nil, nil
 +		}
-+		pcm := audio.DecodeULaw(ulawBytes)
++		pcm := ulawBytes
++		if s.Encoding == "audio/x-mulaw" {
++			pcm = audio.DecodeULaw(ulawBytes)
++		} else if len(pcm)%2 != 0 {
++			return nil, fmt.Errorf("odd-length L16 PCM")
++		}
 +		if len(pcm) == 0 {
 +			return nil, nil
 +		}
@@ -163,6 +222,18 @@ index 0000000..a29ca2d
 +		}
 +		if s.VobizRate != sr {
 +			pcm = audio.Resample16MonoAlloc(pcm, s.VobizRate, sr)
++		}
++		s.chunks++
++		for i := 0; i+1 < len(pcm); i += 2 {
++			v := float64(int16(binary.LittleEndian.Uint16(pcm[i:]))) / 32768
++			s.sumSquares += v * v
++			s.samples++
++			if math.Abs(v) > s.peak {
++				s.peak = math.Abs(v)
++			}
++		}
++		if s.chunks%100 == 0 {
++			logger.Info("vobiz inbound aggregate: chunks=%d rms=%.5f peak=%.5f pcm_rate=%d", s.chunks, math.Sqrt(s.sumSquares/float64(s.samples)), s.peak, sr)
 +		}
 +		return frames.NewAudioRawFrame(pcm, sr, 1, 0), nil
 +	case "stop":
@@ -178,15 +249,20 @@ index 0000000..a29ca2d
 +)
 diff --git a/pkg/frames/serialize/vobiz/vobiz_test.go b/pkg/frames/serialize/vobiz/vobiz_test.go
 new file mode 100644
-index 0000000..03bb2c2
+index 0000000..495b6f3
 --- /dev/null
 +++ b/pkg/frames/serialize/vobiz/vobiz_test.go
-@@ -0,0 +1,32 @@
+@@ -0,0 +1,85 @@
 +package vobiz
 +
 +import (
++	"encoding/base64"
++	"encoding/binary"
 +	"encoding/json"
++	"fmt"
++	"github.com/Voxray-AI/Voxray/pkg/audio"
 +	"github.com/Voxray-AI/Voxray/pkg/frames"
++	"math"
 +	"testing"
 +)
 +
@@ -212,6 +288,107 @@ index 0000000..03bb2c2
 +	json.Unmarshal(b, &m)
 +	if m["streamId"] != "test-stream" {
 +		t.Fatal("clear lacks ID")
++	}
++}
++
++func TestFormatsAndPlayback(t *testing.T) {
++	for _, enc := range []string{"audio/x-mulaw", "audio/x-l16"} {
++		s := NewSerializer("", "", nil)
++		start := fmt.Sprintf(`{"event":"start","start":{"streamId":"synthetic","callId":"test","mediaFormat":{"encoding":%q,"sampleRate":8000}}}`, enc)
++		if _, err := s.Deserialize([]byte(start)); err != nil {
++			t.Fatal(err)
++		}
++		pcm := make([]byte, 320)
++		for i := 0; i < 160; i++ {
++			binary.LittleEndian.PutUint16(pcm[i*2:], uint16(int16(800*math.Sin(float64(i)*2*math.Pi*440/8000))))
++		}
++		payload := pcm
++		if enc == "audio/x-mulaw" {
++			payload = audio.EncodeULaw(pcm)
++		}
++		raw := fmt.Sprintf(`{"event":"media","media":{"payload":%q}}`, base64.StdEncoding.EncodeToString(payload))
++		f, err := s.Deserialize([]byte(raw))
++		if err != nil {
++			t.Fatal(err)
++		}
++		a := f.(*frames.AudioRawFrame)
++		if len(a.Audio) != 640 || a.SampleRate != 16000 {
++			t.Fatalf("wrong decoded frame: %d/%d", len(a.Audio), a.SampleRate)
++		}
++		out, err := s.Serialize(a)
++		if err != nil {
++			t.Fatal(err)
++		}
++		var m struct {
++			StreamId string
++			Media    struct {
++				ContentType string
++				SampleRate  int
++				Payload     string
++			}
++		}
++		json.Unmarshal(out, &m)
++		b, _ := base64.StdEncoding.DecodeString(m.Media.Payload)
++		if m.StreamId != "synthetic" || m.Media.ContentType != "audio/x-mulaw" || m.Media.SampleRate != 8000 || len(b) != 160 {
++			t.Fatalf("bad playback: %s", out)
++		}
++	}
++	s := NewSerializer("", "", nil)
++	if _, err := s.Deserialize([]byte(`{"event":"start","start":{"mediaFormat":{"encoding":"bad","sampleRate":8000}}}`)); err == nil {
++		t.Fatal("unsupported format accepted")
++	}
++}
+diff --git a/pkg/processors/voice/turn.go b/pkg/processors/voice/turn.go
+index 901d607..738aee7 100644
+--- a/pkg/processors/voice/turn.go
++++ b/pkg/processors/voice/turn.go
+@@ -179,7 +179,7 @@ func (p *TurnProcessor) ProcessFrame(ctx context.Context, f frames.Frame, dir pr
+ 		isSpeech = false
+ 	}
+ 	if isSpeech != p.lastVADSpeech {
+-		logger.Debug("pipeline (turn): VAD speech=%v", isSpeech)
++		logger.Info("pipeline (turn): VAD speech=%v", isSpeech)
+ 		p.lastVADSpeech = isSpeech
+ 	}
+ 
+diff --git a/pkg/processors/voice/turn_test.go b/pkg/processors/voice/turn_test.go
+index 4c55845..0f2bdc3 100644
+--- a/pkg/processors/voice/turn_test.go
++++ b/pkg/processors/voice/turn_test.go
+@@ -2,6 +2,9 @@ package voice
+ 
+ import (
+ 	"context"
++	"encoding/binary"
++	"github.com/Voxray-AI/Voxray/pkg/audio/vad"
++	"math"
+ 	"testing"
+ 	"time"
+ 
+@@ -335,3 +338,25 @@ func TestTurnProcessorBargeInEmitsUserStartedSpeakingWhenReSpeaking(t *testing.T
+ 		t.Fatalf("after re-speak (barge-in): expected 2 UserStartedSpeakingFrames total, got %d", startedCount)
+ 	}
+ }
++
++func TestQuietPhoneSpeechCompletes(t *testing.T) {
++	v := vad.NewEnergyDetectorWithParams(vad.Params{Confidence: .5, MinVolume: .005, Threshold: .01, StopSecs: .3})
++	a := turn.NewSilenceTurnAnalyzer(turn.Params{StopSecs: 1.5})
++	p := NewTurnProcessor("phone", v, a, 16000, 1, false)
++	col := &collectProcessor{}
++	p.SetNext(col)
++	for n := 0; n < 160; n++ {
++		b := make([]byte, 640)
++		if n < 50 {
++			for i := 0; i < 320; i++ {
++				binary.LittleEndian.PutUint16(b[i*2:], uint16(int16(800*math.Sin(float64(i)*2*math.Pi*440/16000))))
++			}
++		}
++		if err := p.ProcessFrame(context.Background(), frames.NewAudioRawFrame(b, 16000, 1, 0), processors.Downstream); err != nil {
++			t.Fatal(err)
++		}
++	}
++	if col.findFrame(func(f frames.Frame) bool { _, ok := f.(*frames.AudioRawFrame); return ok }) == nil {
++		t.Fatal("quiet speech never reached STT")
 +	}
 +}
 diff --git a/pkg/runner/telephony.go b/pkg/runner/telephony.go
@@ -256,7 +433,7 @@ index e02a5ee..84b4333 100644
  		return nil
  	}
 diff --git a/pkg/server/server.go b/pkg/server/server.go
-index 7b4f02b..962612f 100644
+index 7b4f02b..714176e 100644
 --- a/pkg/server/server.go
 +++ b/pkg/server/server.go
 @@ -480,7 +480,7 @@ func registerHandlers(mux *http.ServeMux, cfg *config.Config, ctx context.Contex
@@ -306,7 +483,23 @@ index 7b4f02b..962612f 100644
  		if r.Method != http.MethodGet {
  			api.RespondError(w, r, &api.APIError{StatusCode: http.StatusMethodNotAllowed, Code: api.CodeBadRequest, Message: "Method not allowed"})
  			return
-@@ -574,7 +578,24 @@ func registerTelephonyRoutes(mux *http.ServeMux, cfg *config.Config, ctx context
+@@ -565,6 +569,15 @@ func registerTelephonyRoutes(mux *http.ServeMux, cfg *config.Config, ctx context
+ 			logger.Error("telephony: no serializer for provider %s", data.Provider)
+ 			return
+ 		}
++		// Consume handshake format before transport starts; start was already read above.
++		if data.Provider == "vobiz" {
++			for _, raw := range [][]byte{first, second} {
++				if _, err := ser.Deserialize(raw); err != nil {
++					logger.Error("vobiz handshake: %v", err)
++					return
++				}
++			}
++		}
+ 		tr := ws.NewConnTransport(conn, 64, 64, ser, nil)
+ 		if err := tr.Start(ctx); err != nil {
+ 			logger.Error("telephony transport start: %v", err)
+@@ -574,7 +587,24 @@ func registerTelephonyRoutes(mux *http.ServeMux, cfg *config.Config, ctx context
  			go onTransport(ctx, tr)
  		}
  		<-tr.Done()
